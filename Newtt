@@ -1,0 +1,708 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Aplikasi NEWTT RSUD Dr. Soedono Madiun</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script type="module">
+        // Konfigurasi Firebase (akan diisi oleh environment)
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {
+            apiKey: "YOUR_API_KEY", // Ganti dengan config Anda jika testing lokal
+            authDomain: "YOUR_AUTH_DOMAIN",
+            projectId: "YOUR_PROJECT_ID",
+            storageBucket: "YOUR_STORAGE_BUCKET",
+            messagingSenderId: "YOUR_MESSAGING_SENDER_ID",
+            appId: "YOUR_APP_ID"
+        };
+
+        // ID Aplikasi (akan diisi oleh environment)
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'newtt-rsud-soedono-madiun-dev';
+
+        // Inisialisasi Firebase
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, getDoc, collection, addDoc, query, where, getDocs, serverTimestamp, onSnapshot, orderBy } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        setLogLevel('debug'); // Aktifkan log untuk debugging Firestore
+
+        let userId = null;
+        let currentPatientId = null;
+        let unsubscribePatientList = null;
+        let unsubscribeObservations = null;
+
+        // Fungsi untuk otentikasi
+        async function authenticateUser() {
+            try {
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                    console.log("Signed in with custom token.");
+                } else {
+                    await signInAnonymously(auth);
+                    console.log("Signed in anonymously.");
+                }
+            } catch (error) {
+                console.error("Authentication error:", error);
+                displayMessage("Gagal melakukan otentikasi: " + error.message, "error");
+            }
+
+            onAuthStateChanged(auth, (user) => {
+                if (user) {
+                    userId = user.uid;
+                    console.log("User ID:", userId);
+                    document.getElementById('authStatus').textContent = `Status: Terautentikasi (User ID: ${userId.substring(0,8)}...)`;
+                    loadPatientList();
+                } else {
+                    userId = null;
+                    document.getElementById('authStatus').textContent = "Status: Belum Terautentikasi";
+                    console.log("User signed out or not authenticated.");
+                }
+            });
+        }
+
+
+        // --- UI Elements ---
+        const patientForm = document.getElementById('patientForm');
+        const riskFactorForm = document.getElementById('riskFactorForm');
+        const observationForm = document.getElementById('observationForm');
+        const observationLog = document.getElementById('observationLog');
+        const patientListElement = document.getElementById('patientList');
+        const currentPatientInfoElement = document.getElementById('currentPatientInfo');
+        const newPatientSection = document.getElementById('newPatientSection');
+        const patientDetailsSection = document.getElementById('patientDetailsSection');
+        const addObservationBtn = document.getElementById('addObservationBtn');
+        const backToPatientListBtn = document.getElementById('backToPatientListBtn');
+        const messageContainer = document.getElementById('messageContainer');
+
+        // --- Risk Factors Definitions ---
+        const riskFactorsDefinition = [
+            { id: 'sepsis_prom_preterm', label: 'Sepsis: PROM > 18 jam (preterm)' },
+            { id: 'sepsis_prom_term', label: 'Sepsis: Ketuban Pecah Dini (KPD) (term)' },
+            { id: 'sepsis_maternal_fever', label: 'Sepsis: Demam maternal >38°C' },
+            { id: 'sepsis_maternal_gbs', label: 'Sepsis: GBS maternal (+)' },
+            { id: 'sepsis_previous_gbs_sibling', label: 'Sepsis: Riwayat GBS pada bayi sebelumnya' },
+            { id: 'metabolic_maternal_diabetes', label: 'Metabolik: Diabetes maternal' },
+            { id: 'metabolic_maternal_beta_blockers', label: 'Metabolik: Ibu menggunakan Beta Blocker' },
+            { id: 'metabolic_birthweight_sga', label: 'Metabolik: BB Lahir <= P2 (Kecil Masa Kehamilan)' },
+            { id: 'intrapartum_meconium_apgar', label: 'Intrapartum: Air ketuban bercampur mekonium & APGAR <=7 (5 menit)' },
+            { id: 'intrapartum_cord_ph', label: 'Intrapartum: pH tali pusat <=7.1' },
+            { id: 'intrapartum_apgar_5min', label: 'Intrapartum: Skor APGAR <=7 (5 menit)' },
+            { id: 'intrapartum_base_excess', label: 'Intrapartum: Base Excess <= -12 mmol/L' },
+            { id: 'intrapartum_pathological_ctg', label: 'Intrapartum: CTG patologis' },
+            { id: 'intrapartum_ppv_5min', label: 'Intrapartum: VTP > 5 menit' },
+            { id: 'intrapartum_maternal_pethidine', label: 'Intrapartum: Pethidine maternal <6 jam sebelum lahir' },
+            { id: 'other_gestation_lt_37w', label: 'Lainnya: Usia gestasi <37 minggu' },
+            { id: 'other_custom', label: 'Lainnya (jelaskan):', type: 'text', textId: 'other_custom_text' }
+        ];
+
+        function initializeRiskFactorChecklist() {
+            const container = document.getElementById('riskFactorsChecklist');
+            container.innerHTML = '';
+            riskFactorsDefinition.forEach(factor => {
+                const div = document.createElement('div');
+                div.classList.add('flex', 'items-center', 'mb-2');
+                const checkbox = document.createElement('input');
+                checkbox.type = 'checkbox';
+                checkbox.id = factor.id;
+                checkbox.name = factor.id;
+                checkbox.classList.add('h-4', 'w-4', 'text-blue-600', 'border-gray-300', 'rounded', 'focus:ring-blue-500');
+                
+                const label = document.createElement('label');
+                label.htmlFor = factor.id;
+                label.textContent = factor.label;
+                label.classList.add('ml-2', 'text-sm', 'text-gray-700');
+                
+                div.appendChild(checkbox);
+                div.appendChild(label);
+
+                if (factor.type === 'text') {
+                    const textField = document.createElement('input');
+                    textField.type = 'text';
+                    textField.id = factor.textId;
+                    textField.name = factor.textId;
+                    textField.classList.add('ml-2', 'mt-1', 'block', 'w-full', 'sm:w-auto', 'border-gray-300', 'rounded-md', 'shadow-sm', 'focus:ring-indigo-500', 'focus:border-indigo-500', 'sm:text-sm', 'p-1');
+                    textField.placeholder = 'Jelaskan...';
+                    div.appendChild(textField);
+                }
+                container.appendChild(div);
+            });
+        }
+        
+        // --- Scoring Logic ---
+        function getScoreColor(parameter, value, effort = null) {
+            if (value === null || value === '' || isNaN(parseFloat(value))) return 'bg-gray-200'; // Default for no value
+
+            value = parseFloat(value);
+            let color = 'bg-green-400'; // Green
+
+            switch (parameter) {
+                case 'rr': // Respiratory Rate
+                    const grunting = effort === 'grunting';
+                    const retractions = effort === 'retractions';
+                    const severeRetractions = effort === 'severe_retractions';
+                    if (value < 20 || value > 70 || severeRetractions) color = 'bg-red-400'; // Red
+                    else if ((value >= 20 && value <= 29) || (value >= 61 && value <= 70) || grunting || retractions) color = 'bg-yellow-400'; // Amber
+                    else if (value >= 30 && value <= 60) color = 'bg-green-400';
+                    else color = 'bg-gray-200'; // If somehow out of defined ranges without red/amber triggers
+                    break;
+                case 'spo2': // Oxygen Saturation
+                    if (value < 85) color = 'bg-red-400';
+                    else if (value >= 85 && value <= 91) color = 'bg-yellow-400';
+                    else if (value >= 92) color = 'bg-green-400';
+                    else color = 'bg-gray-200';
+                    break;
+                case 'temp': // Temperature
+                    if (value < 36.0 || value > 38.0) color = 'bg-red-400';
+                    else if ((value >= 36.0 && value <= 36.4) || (value >=37.6 && value <=38.0)) color = 'bg-yellow-400'; // Adjusted upper amber
+                    else if (value >= 36.5 && value <= 37.5) color = 'bg-green-400';
+                    else color = 'bg-gray-200';
+                    break;
+                case 'hr': // Heart Rate
+                    if (value < 80 || value > 180) color = 'bg-red-400'; // Chart visual suggests >180
+                    else if ((value >= 80 && value <= 99) || (value >= 161 && value <= 180)) color = 'bg-yellow-400';
+                    else if (value >= 100 && value <= 160) color = 'bg-green-400';
+                    else color = 'bg-gray-200';
+                    break;
+                case 'crt': // Capillary Refill Time
+                    if (value > 3) color = 'bg-red-400';
+                    else if (value >= 2 && value <=3) color = 'bg-yellow-400'; // Chart visual: 2-3 amber
+                    else if (value < 2) color = 'bg-green-400'; // Chart visual <2 green
+                    else color = 'bg-gray-200';
+                    break;
+                case 'perfusion': // Peripheral Perfusion (value: 1=Green, 2=Amber, 3=Red)
+                    if (value == 3) color = 'bg-red-400';
+                    else if (value == 2) color = 'bg-yellow-400';
+                    else if (value == 1) color = 'bg-green-400';
+                    else color = 'bg-gray-200';
+                    break;
+                case 'activity': // Activity/LOC (value: 1=Green, 2=Amber, 3=Red)
+                    if (value == 3) color = 'bg-red-400';
+                    else if (value == 2) color = 'bg-yellow-400';
+                    else if (value == 1) color = 'bg-green-400';
+                    else color = 'bg-gray-200';
+                    break;
+                case 'feeding': // Feeding (value: 1=Green, 2=Amber, 3=Red)
+                    if (value == 3) color = 'bg-red-400';
+                    else if (value == 2) color = 'bg-yellow-400';
+                    else if (value == 1) color = 'bg-green-400';
+                    else color = 'bg-gray-200';
+                    break;
+                case 'glucose': // Blood Glucose
+                    if (value < 2.0) color = 'bg-red-400';
+                    else if (value >= 2.0 && value <= 2.5) color = 'bg-yellow-400';
+                    else if (value >= 2.6) color = 'bg-green-400';
+                    else color = 'bg-gray-200';
+                    break;
+            }
+            return color;
+        }
+        
+        function getOverallTrigger(scores) {
+            let redCount = 0;
+            let amberCount = 0;
+            Object.values(scores).forEach(colorClass => {
+                if (colorClass === 'bg-red-400') redCount++;
+                if (colorClass === 'bg-yellow-400') amberCount++;
+            });
+
+            if (redCount > 0) return { text: "ESKALASI SEGERA (MERAH)", color: "bg-red-600 text-white" };
+            if (amberCount >= 2) return { text: "PERTIMBANGKAN ESKALASI (KUNING)", color: "bg-yellow-500 text-black" };
+            if (amberCount === 1) return { text: "OBSERVASI KETAT (KUNING)", color: "bg-yellow-400 text-black" };
+            return { text: "PERAWATAN RUTIN (HIJAU)", color: "bg-green-500 text-white" };
+        }
+
+        // --- Firestore Functions ---
+        async function savePatientData(patientData, riskFactorsData) {
+            if (!userId) {
+                displayMessage("User belum terautentikasi.", "error");
+                return;
+            }
+            try {
+                const patientRef = collection(db, `artifacts/${appId}/users/${userId}/newttPatients`);
+                const docRef = await addDoc(patientRef, {
+                    ...patientData,
+                    riskFactors: riskFactorsData,
+                    createdAt: serverTimestamp()
+                });
+                currentPatientId = docRef.id;
+                displayMessage("Data pasien berhasil disimpan.", "success");
+                showPatientDetailsView(currentPatientId, patientData.name);
+                loadPatientList(); // Refresh list
+            } catch (error) {
+                console.error("Error saving patient data: ", error);
+                displayMessage("Gagal menyimpan data pasien: " + error.message, "error");
+            }
+        }
+
+        async function saveObservationData(observationData) {
+            if (!userId || !currentPatientId) {
+                displayMessage("Pasien belum dipilih atau user belum terautentikasi.", "error");
+                return;
+            }
+            try {
+                const obsCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/newttPatients/${currentPatientId}/observations`);
+                await addDoc(obsCollectionRef, {
+                    ...observationData,
+                    timestamp: serverTimestamp()
+                });
+                displayMessage("Data observasi berhasil disimpan.", "success");
+                observationForm.reset(); // Reset form after successful save
+                // Real-time update will refresh the log via onSnapshot
+            } catch (error) {
+                console.error("Error saving observation: ", error);
+                displayMessage("Gagal menyimpan data observasi: " + error.message, "error");
+            }
+        }
+
+        async function loadPatientList() {
+            if (!userId) return;
+            const patientsCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/newttPatients`);
+            // const q = query(patientsCollectionRef, orderBy("createdAt", "desc")); // Requires composite index if not createdAt
+            const q = query(patientsCollectionRef); // Simpler query for now
+
+            if (unsubscribePatientList) unsubscribePatientList(); // Unsubscribe from previous listener
+
+            unsubscribePatientList = onSnapshot(q, (querySnapshot) => {
+                patientListElement.innerHTML = '<h3 class="text-lg font-semibold mb-2 text-gray-700">Daftar Pasien</h3>';
+                if (querySnapshot.empty) {
+                    patientListElement.innerHTML += '<p class="text-gray-500">Belum ada data pasien.</p>';
+                    return;
+                }
+                const ul = document.createElement('ul');
+                ul.classList.add('space-y-2');
+                querySnapshot.forEach((doc) => {
+                    const patient = doc.data();
+                    const li = document.createElement('li');
+                    li.classList.add('p-3', 'bg-white', 'rounded-lg', 'shadow', 'hover:bg-gray-50', 'cursor-pointer', 'transition-colors', 'duration-150');
+                    li.textContent = `${patient.name} (ID: ${patient.patientId || 'N/A'}) - Gestasi: ${patient.gestationalAge} minggu`;
+                    li.dataset.patientId = doc.id;
+                    li.dataset.patientName = patient.name;
+                    li.addEventListener('click', () => {
+                        showPatientDetailsView(doc.id, patient.name);
+                    });
+                    ul.appendChild(li);
+                });
+                patientListElement.appendChild(ul);
+            }, (error) => {
+                console.error("Error loading patient list: ", error);
+                displayMessage("Gagal memuat daftar pasien: " + error.message, "error");
+            });
+        }
+        
+        async function loadObservations(patientId) {
+            if (!userId || !patientId) return;
+            const obsCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/newttPatients/${patientId}/observations`);
+            // const q = query(obsCollectionRef, orderBy("timestamp", "desc")); // Requires composite index
+             const q = query(obsCollectionRef);
+
+
+            if (unsubscribeObservations) unsubscribeObservations(); // Unsubscribe from previous listener
+
+            unsubscribeObservations = onSnapshot(q, (querySnapshot) => {
+                observationLog.innerHTML = '<h4 class="text-md font-semibold mt-4 mb-2 text-gray-700">Log Observasi</h4>';
+                if (querySnapshot.empty) {
+                    observationLog.innerHTML += '<p class="text-gray-500">Belum ada data observasi untuk pasien ini.</p>';
+                    return;
+                }
+                
+                // Sort in memory if orderBy is problematic without index
+                const observations = [];
+                querySnapshot.forEach(doc => observations.push({ id: doc.id, ...doc.data() }));
+                observations.sort((a, b) => (b.timestamp?.toDate() || 0) - (a.timestamp?.toDate() || 0));
+
+
+                observations.forEach((obsData) => {
+                    const div = document.createElement('div');
+                    div.classList.add('p-3', 'mb-3', 'bg-gray-50', 'rounded-lg', 'shadow-sm', 'border', 'border-gray-200');
+                    
+                    const time = obsData.timestamp ? new Date(obsData.timestamp.seconds * 1000).toLocaleString('id-ID') : 'N/A';
+                    let content = `<p class="text-sm font-medium text-gray-600">Waktu: ${time}</p>`;
+                    
+                    const scores = {};
+                    content += '<div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2 mt-2">';
+                    
+                    if (obsData.rr !== undefined) { 
+                        scores.rr = getScoreColor('rr', obsData.rr, obsData.respEffort);
+                        content += `<div class="p-2 rounded ${scores.rr}"><span class="font-semibold">RR:</span> ${obsData.rr} bpm<br/><span class="text-xs">Upaya Napas: ${obsData.respEffort || 'N/A'}</span></div>`;
+                    }
+                    if (obsData.spo2 !== undefined) {
+                        scores.spo2 = getScoreColor('spo2', obsData.spo2);
+                        content += `<div class="p-2 rounded ${scores.spo2}"><span class="font-semibold">SpO2:</span> ${obsData.spo2}% ${obsData.o2given ? '(O2: '+obsData.o2given+(obsData.o2unit || '')+')' : ''}</div>`;
+                    }
+                    if (obsData.temp !== undefined) {
+                        scores.temp = getScoreColor('temp', obsData.temp);
+                        content += `<div class="p-2 rounded ${scores.temp}"><span class="font-semibold">Suhu:</span> ${obsData.temp}°C</div>`;
+                    }
+                    if (obsData.hr !== undefined) {
+                        scores.hr = getScoreColor('hr', obsData.hr);
+                        content += `<div class="p-2 rounded ${scores.hr}"><span class="font-semibold">Nadi:</span> ${obsData.hr}x/mnt</div>`;
+                    }
+                    if (obsData.crt !== undefined) {
+                        scores.crt = getScoreColor('crt', obsData.crt);
+                        content += `<div class="p-2 rounded ${scores.crt}"><span class="font-semibold">CRT:</span> ${obsData.crt} dtk</div>`;
+                    }
+                     if (obsData.perfusion !== undefined) {
+                        scores.perfusion = getScoreColor('perfusion', obsData.perfusion);
+                        content += `<div class="p-2 rounded ${scores.perfusion}"><span class="font-semibold">Perfusi:</span> ${obsData.perfusion_text || 'N/A'}</div>`;
+                    }
+                    if (obsData.activity !== undefined) {
+                        scores.activity = getScoreColor('activity', obsData.activity);
+                        content += `<div class="p-2 rounded ${scores.activity}"><span class="font-semibold">Aktivitas:</span> ${obsData.activity_text || 'N/A'}</div>`;
+                    }
+                    if (obsData.feeding !== undefined) {
+                        scores.feeding = getScoreColor('feeding', obsData.feeding);
+                        content += `<div class="p-2 rounded ${scores.feeding}"><span class="font-semibold">Makan:</span> ${obsData.feeding_text || 'N/A'}</div>`;
+                    }
+                    if (obsData.glucose !== undefined && obsData.glucose !== null && obsData.glucose !== '') {
+                        scores.glucose = getScoreColor('glucose', obsData.glucose);
+                        content += `<div class="p-2 rounded ${scores.glucose}"><span class="font-semibold">GDS:</span> ${obsData.glucose} mmol/L</div>`;
+                    }
+                    content += '</div>'; // end grid
+
+                    const overall = getOverallTrigger(scores);
+                    content += `<div class="mt-3 p-2 rounded text-center font-semibold ${overall.color}">${overall.text}</div>`;
+                    if(obsData.notes) content += `<p class="text-sm mt-2 text-gray-600"><span class="font-semibold">Catatan:</span> ${obsData.notes}</p>`;
+
+                    div.innerHTML = content;
+                    observationLog.appendChild(div);
+                });
+            }, (error) => {
+                console.error("Error loading observations: ", error);
+                displayMessage("Gagal memuat data observasi: " + error.message, "error");
+            });
+        }
+        
+        // --- UI Control ---
+        function showPatientListView() {
+            newPatientSection.classList.remove('hidden');
+            patientListElement.classList.remove('hidden');
+            patientDetailsSection.classList.add('hidden');
+            currentPatientId = null;
+            if (unsubscribeObservations) unsubscribeObservations();
+            observationLog.innerHTML = ''; // Clear previous logs
+        }
+
+        async function showPatientDetailsView(patientId, patientName) {
+            currentPatientId = patientId;
+            newPatientSection.classList.add('hidden');
+            patientListElement.classList.add('hidden');
+            patientDetailsSection.classList.remove('hidden');
+            currentPatientInfoElement.textContent = `Data Observasi untuk: ${patientName} (ID: ${patientId.substring(0,8)}...)`;
+            
+            // Load risk factors for the selected patient
+            if (!userId || !currentPatientId) return;
+            const patientDocRef = doc(db, `artifacts/${appId}/users/${userId}/newttPatients/${currentPatientId}`);
+            try {
+                const docSnap = await getDoc(patientDocRef);
+                if (docSnap.exists()) {
+                    const patientData = docSnap.data();
+                    displayRiskFactors(patientData.riskFactors);
+                } else {
+                    console.log("No such patient document!");
+                    document.getElementById('displayRiskFactorsArea').innerHTML = '<p class="text-red-500">Data faktor risiko tidak ditemukan.</p>';
+                }
+            } catch (error) {
+                console.error("Error fetching patient risk factors:", error);
+                document.getElementById('displayRiskFactorsArea').innerHTML = `<p class="text-red-500">Gagal memuat faktor risiko: ${error.message}</p>`;
+            }
+
+            loadObservations(patientId);
+        }
+
+        function displayRiskFactors(riskData) {
+            const container = document.getElementById('displayRiskFactorsArea');
+            container.innerHTML = '<h4 class="text-md font-semibold mb-2 text-gray-700">Faktor Risiko Teridentifikasi:</h4>';
+            if (!riskData || Object.keys(riskData).length === 0) {
+                container.innerHTML += '<p class="text-gray-500">Tidak ada faktor risiko spesifik yang dipilih.</p>';
+                return;
+            }
+            const ul = document.createElement('ul');
+            ul.classList.add('list-disc', 'list-inside', 'space-y-1', 'text-sm', 'text-gray-600');
+            riskFactorsDefinition.forEach(def => {
+                if (riskData[def.id]) {
+                    const li = document.createElement('li');
+                    li.textContent = def.label;
+                    if (def.type === 'text' && riskData[def.textId]) {
+                        li.textContent += ` ${riskData[def.textId]}`;
+                    }
+                    ul.appendChild(li);
+                }
+            });
+             if (riskData.other_custom && riskData.other_custom_text) { // Handle custom text if checkbox wasn't explicitly saved but text was
+                const existingCustom = Array.from(ul.children).find(child => child.textContent.startsWith(riskFactorsDefinition.find(f=>f.id==='other_custom').label));
+                if(!existingCustom){
+                    const li = document.createElement('li');
+                    li.textContent = `${riskFactorsDefinition.find(f=>f.id==='other_custom').label} ${riskData.other_custom_text}`;
+                    ul.appendChild(li);
+                }
+            }
+            container.appendChild(ul);
+        }
+
+
+        function displayMessage(message, type = "info") {
+            messageContainer.textContent = message;
+            messageContainer.classList.remove('bg-green-100', 'text-green-700', 'bg-red-100', 'text-red-700', 'bg-blue-100', 'text-blue-700');
+            if (type === "success") {
+                messageContainer.classList.add('bg-green-100', 'text-green-700');
+            } else if (type === "error") {
+                messageContainer.classList.add('bg-red-100', 'text-red-700');
+            } else {
+                messageContainer.classList.add('bg-blue-100', 'text-blue-700');
+            }
+            messageContainer.classList.remove('hidden');
+            setTimeout(() => {
+                messageContainer.classList.add('hidden');
+            }, 5000);
+        }
+
+        // --- Event Listeners ---
+        patientForm.addEventListener('submit', (e) => {
+            e.preventDefault();
+            const patientData = {
+                name: document.getElementById('patientName').value,
+                patientId: document.getElementById('patientMedicalId').value,
+                dob: document.getElementById('patientDob').value,
+                gestationalAge: document.getElementById('gestationalAge').value,
+            };
+            
+            const riskFactorsData = {};
+            riskFactorsDefinition.forEach(factor => {
+                const checkbox = document.getElementById(factor.id);
+                if (checkbox && checkbox.checked) {
+                    riskFactorsData[factor.id] = true;
+                    if (factor.type === 'text') {
+                        const textField = document.getElementById(factor.textId);
+                        if (textField) riskFactorsData[factor.textId] = textField.value;
+                    }
+                }
+            });
+
+            savePatientData(patientData, riskFactorsData);
+            patientForm.reset();
+            riskFactorForm.reset(); // Also reset risk factors part of the form
+        });
+
+        observationForm.addEventListener('submit', (e) => {
+            e.preventDefault();
+            const obsData = {
+                rr: parseFloat(document.getElementById('rr').value) || null,
+                respEffort: document.getElementById('respEffort').value || null,
+                spo2: parseFloat(document.getElementById('spo2').value) || null,
+                o2given: document.getElementById('o2given').value || null,
+                o2unit: document.getElementById('o2unit').value || null,
+                temp: parseFloat(document.getElementById('temp').value) || null,
+                hr: parseFloat(document.getElementById('hr').value) || null,
+                crt: parseFloat(document.getElementById('crt').value) || null,
+                bpSystolic: parseFloat(document.getElementById('bpSystolic').value) || null,
+                bpDiastolic: parseFloat(document.getElementById('bpDiastolic').value) || null,
+                perfusion: document.getElementById('perfusion').value ? parseInt(document.getElementById('perfusion').value) : null,
+                perfusion_text: document.getElementById('perfusion').options[document.getElementById('perfusion').selectedIndex]?.text || null,
+                activity: document.getElementById('activity').value ? parseInt(document.getElementById('activity').value) : null,
+                activity_text: document.getElementById('activity').options[document.getElementById('activity').selectedIndex]?.text || null,
+                feeding: document.getElementById('feeding').value ? parseInt(document.getElementById('feeding').value) : null,
+                feeding_text: document.getElementById('feeding').options[document.getElementById('feeding').selectedIndex]?.text || null,
+                urineOutput: document.getElementById('urineOutput').value || null,
+                glucose: document.getElementById('glucose').value !== '' ? parseFloat(document.getElementById('glucose').value) : null,
+                bilirubin: document.getElementById('bilirubin').value || null,
+                notes: document.getElementById('notes').value || null,
+            };
+            saveObservationData(obsData);
+        });
+        
+        addObservationBtn.addEventListener('click', () => {
+            observationForm.classList.toggle('hidden');
+        });
+
+        backToPatientListBtn.addEventListener('click', () => {
+            showPatientListView();
+        });
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            authenticateUser();
+            initializeRiskFactorChecklist();
+            showPatientListView();
+        });
+
+    </script>
+    <style>
+        body { font-family: 'Inter', sans-serif; }
+        .form-input { @apply mt-1 block w-full border-gray-300 rounded-md shadow-sm focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm p-2; }
+        .form-label { @apply block text-sm font-medium text-gray-700; }
+        .btn { @apply px-4 py-2 border border-transparent rounded-md shadow-sm text-sm font-medium text-white; }
+        .btn-primary { @apply bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500; }
+        .btn-secondary { @apply bg-gray-600 hover:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-gray-500; }
+        .hidden { display: none; }
+    </style>
+</head>
+<body class="bg-gray-100 p-4 md:p-8">
+    <div class="container mx-auto max-w-4xl bg-white p-6 rounded-xl shadow-2xl">
+        <header class="mb-6 text-center">
+            <h1 class="text-2xl md:text-3xl font-bold text-blue-700">Aplikasi NEWTT</h1>
+            <p class="text-lg text-gray-600">RSUD Dr. Soedono Madiun</p>
+            <p id="authStatus" class="text-xs text-gray-500 mt-1">Status: Mengautentikasi...</p>
+        </header>
+
+        <div id="messageContainer" class="hidden p-3 mb-4 rounded-md text-sm"></div>
+
+        <section id="newPatientSection">
+            <div class="bg-gray-50 p-6 rounded-lg shadow-md mb-6">
+                <h2 class="text-xl font-semibold mb-4 text-gray-800 border-b pb-2">Tambah Pasien Baru</h2>
+                <form id="patientForm">
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                        <div>
+                            <label for="patientName" class="form-label">Nama Pasien:</label>
+                            <input type="text" id="patientName" name="patientName" class="form-input" required>
+                        </div>
+                        <div>
+                            <label for="patientMedicalId" class="form-label">No. Rekam Medis (Opsional):</label>
+                            <input type="text" id="patientMedicalId" name="patientMedicalId" class="form-input">
+                        </div>
+                        <div>
+                            <label for="patientDob" class="form-label">Tanggal Lahir:</label>
+                            <input type="date" id="patientDob" name="patientDob" class="form-input" required>
+                        </div>
+                        <div>
+                            <label for="gestationalAge" class="form-label">Usia Gestasi (minggu):</label>
+                            <input type="number" id="gestationalAge" name="gestationalAge" class="form-input" required>
+                        </div>
+                    </div>
+                    
+                    <div id="riskFactorForm" class="mb-4">
+                        <h3 class="text-lg font-medium text-gray-700 mb-2">Identifikasi Faktor Risiko:</h3>
+                        <div id="riskFactorsChecklist" class="space-y-2 max-h-60 overflow-y-auto p-2 border rounded-md">
+                            </div>
+                    </div>
+                    <button type="submit" class="btn btn-primary w-full md:w-auto">Simpan Pasien & Faktor Risiko</button>
+                </form>
+            </div>
+            <hr class="my-6">
+            <div id="patientList" class="mt-6">
+                </div>
+        </section>
+
+        <section id="patientDetailsSection" class="hidden">
+            <button id="backToPatientListBtn" class="btn btn-secondary mb-4">&larr; Kembali ke Daftar Pasien</button>
+            <h2 id="currentPatientInfo" class="text-xl font-semibold mb-4 text-gray-800"></h2>
+            
+            <div id="displayRiskFactorsArea" class="mb-6 p-4 bg-blue-50 border border-blue-200 rounded-md">
+                </div>
+
+            <button id="addObservationBtn" class="btn btn-primary mb-4">Tambah Observasi Baru</button>
+            <form id="observationForm" class="hidden bg-gray-50 p-6 rounded-lg shadow-md mb-6">
+                <h3 class="text-lg font-semibold mb-4 text-gray-800 border-b pb-2">Form Observasi</h3>
+                <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                    <div>
+                        <label for="rr" class="form-label">Frekuensi Napas (x/menit):</label>
+                        <input type="number" id="rr" name="rr" class="form-input">
+                    </div>
+                    <div>
+                        <label for="respEffort" class="form-label">Upaya Napas:</label>
+                        <select id="respEffort" name="respEffort" class="form-input">
+                            <option value="">Tidak Ada</option>
+                            <option value="mild_retractions">Retraksi Ringan</option>
+                            <option value="moderate_retractions">Retraksi Sedang</option>
+                            <option value="severe_retractions">Retraksi Berat</option>
+                            <option value="grunting">Merintih (Grunting)</option>
+                            <option value="nasal_flaring">Napas Cuping Hidung</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label for="spo2" class="form-label">Saturasi Oksigen (%):</label>
+                        <input type="number" id="spo2" name="spo2" class="form-input">
+                    </div>
+                     <div>
+                        <label for="o2given" class="form-label">Oksigen Diberikan (L/mnt atau FiO2%):</label>
+                        <div class="flex">
+                            <input type="number" step="0.1" id="o2given" name="o2given" class="form-input rounded-r-none">
+                            <select id="o2unit" name="o2unit" class="form-input rounded-l-none border-l-0">
+                                <option value="L/min">L/min</option>
+                                <option value="%FiO2">%FiO2</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div>
+                        <label for="temp" class="form-label">Suhu (°C):</label>
+                        <input type="number" step="0.1" id="temp" name="temp" class="form-input">
+                    </div>
+                    <div>
+                        <label for="hr" class="form-label">Frekuensi Nadi (x/menit):</label>
+                        <input type="number" id="hr" name="hr" class="form-input">
+                    </div>
+                    <div>
+                        <label for="crt" class="form-label">CRT (detik):</label>
+                        <input type="number" step="0.1" id="crt" name="crt" class="form-input">
+                    </div>
+                    <div>
+                        <label for="bpSystolic" class="form-label">Tekanan Darah Sistolik (mmHg):</label>
+                        <input type="number" id="bpSystolic" name="bpSystolic" class="form-input">
+                    </div>
+                    <div>
+                        <label for="bpDiastolic" class="form-label">Tekanan Darah Diastolik (mmHg):</label>
+                        <input type="number" id="bpDiastolic" name="bpDiastolic" class="form-input">
+                    </div>
+                     <div>
+                        <label for="perfusion" class="form-label">Perfusi Perifer:</label>
+                        <select id="perfusion" name="perfusion" class="form-input">
+                            <option value="">Pilih Perfusi</option>
+                            <option value="1">Hangat & Merah Muda</option>
+                            <option value="2">Dingin ATAU Pucat/Belang</option>
+                            <option value="3">Dingin DAN Pucat/Belang/Sianosis</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label for="activity" class="form-label">Aktivitas/Kesadaran:</label>
+                        <select id="activity" name="activity" class="form-input">
+                            <option value="">Pilih Aktivitas</option>
+                            <option value="1">Sadar, Aktif, Tonus Normal</option>
+                            <option value="2">Letargi, Iritabel, Gelisah, High-pitched cry</option>
+                            <option value="3">Tidak Responsif, Kejang, Lunglai/Kaku</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label for="feeding" class="form-label">Pemberian Makan:</label>
+                        <select id="feeding" name="feeding" class="form-input">
+                            <option value="">Pilih Status Makan</option>
+                            <option value="1">Baik, Toleransi ASI/Formula</option>
+                            <option value="2">Kurang Baik, Asupan Berkurang, Muntah Sedikit/Sering</option>
+                            <option value="3">Intoleran, Muntah Bilious/Darah, Distensi Abdomen</option>
+                        </select>
+                    </div>
+                     <div>
+                        <label for="urineOutput" class="form-label">Output Urin:</label>
+                        <select id="urineOutput" name="urineOutput" class="form-input">
+                            <option value="">Pilih Output Urin</option>
+                            <option value="Adekuat">Adekuat</option>
+                            <option value="Berkurang">Berkurang</option>
+                            <option value="Tidak ada >8jam">Tidak ada >8jam</option>
+                        </select>
+                    </div>
+                     <div>
+                        <label for="glucose" class="form-label">Gula Darah Sewaktu (mmol/L):</label>
+                        <input type="number" step="0.1" id="glucose" name="glucose" class="form-input">
+                    </div>
+                     <div>
+                        <label for="bilirubin" class="form-label">Bilirubin (jika diindikasikan):</label>
+                        <input type="text" id="bilirubin" name="bilirubin" class="form-input">
+                    </div>
+                    <div class="md:col-span-2 lg:col-span-3">
+                        <label for="notes" class="form-label">Catatan Tambahan:</label>
+                        <textarea id="notes" name="notes" rows="3" class="form-input"></textarea>
+                    </div>
+                </div>
+                <button type="submit" class="btn btn-primary mt-6 w-full md:w-auto">Simpan Observasi</button>
+            </form>
+
+            <div id="observationLog" class="mt-6">
+                </div>
+        </section>
+    </div>
+</body>
+</html>
+
